@@ -1,5 +1,5 @@
 ;; title: Lotto
-;; version: 1.0.0
+;; version: 2.0.0
 ;; summary: Decentralized lottery with transparent on-chain ticket sales and drawing
 ;; description: A fully decentralized lottery system where users can buy tickets, and winners are drawn using block hash randomness
 
@@ -23,6 +23,21 @@
 (define-constant OWNER_FEE_PERCENTAGE u5)
 (define-constant REFERRAL_BONUS_PERCENTAGE u10)
 (define-constant MIN_REFERRAL_REWARD u50000)
+
+(define-constant TIER_BRONZE u0)
+(define-constant TIER_SILVER u1)
+(define-constant TIER_GOLD u2)
+(define-constant TIER_PLATINUM u3)
+
+(define-constant BRONZE_THRESHOLD u0)
+(define-constant SILVER_THRESHOLD u10)
+(define-constant GOLD_THRESHOLD u25)
+(define-constant PLATINUM_THRESHOLD u50)
+
+(define-constant BRONZE_MULTIPLIER u100)
+(define-constant SILVER_MULTIPLIER u125)
+(define-constant GOLD_MULTIPLIER u150)
+(define-constant PLATINUM_MULTIPLIER u200)
 
 (define-data-var lottery-id uint u0)
 (define-data-var is-lottery-active bool false)
@@ -53,9 +68,13 @@
     {user: principal} 
     {referrer: principal, total-referred: uint, lifetime-rewards: uint})
 
-(define-map referral-rewards 
-    {referrer: principal} 
+(define-map referral-rewards
+    {referrer: principal}
     {total-referrals: uint, unclaimed-rewards: uint, lifetime-earnings: uint})
+
+(define-map user-tier-info
+    {user: principal}
+    {lifetime-tickets: uint, current-tier: uint})
 
 (define-private (get-random-number (target-block uint) (max-value uint))
     (let ((block-hash (unwrap! (get-stacks-block-info? id-header-hash target-block) u0)))
@@ -82,16 +101,41 @@
         true))
 
 (define-private (add-ticket-to-user (lotto-id uint) (user principal) (ticket-number uint))
-    (let ((current-data (default-to {ticket-count: u0, tickets: (list)} 
+    (let ((current-data (default-to {ticket-count: u0, tickets: (list)}
                                   (map-get? user-tickets {lottery-id: lotto-id, user: user}))))
         (let ((new-count (+ (get ticket-count current-data) u1))
               (current-tickets (get tickets current-data)))
             (if (< (len current-tickets) u20)
-                (map-set user-tickets 
+                (map-set user-tickets
                     {lottery-id: lotto-id, user: user}
-                    {ticket-count: new-count, 
+                    {ticket-count: new-count,
                      tickets: (unwrap! (as-max-len? (append current-tickets ticket-number) u20) false)})
                 false))))
+
+(define-private (calculate-tier (lifetime-tickets uint))
+    (if (>= lifetime-tickets PLATINUM_THRESHOLD)
+        TIER_PLATINUM
+        (if (>= lifetime-tickets GOLD_THRESHOLD)
+            TIER_GOLD
+            (if (>= lifetime-tickets SILVER_THRESHOLD)
+                TIER_SILVER
+                TIER_BRONZE))))
+
+(define-private (get-multiplier-for-tier (tier uint))
+    (if (is-eq tier TIER_PLATINUM)
+        PLATINUM_MULTIPLIER
+        (if (is-eq tier TIER_GOLD)
+            GOLD_MULTIPLIER
+            (if (is-eq tier TIER_SILVER)
+                SILVER_MULTIPLIER
+                BRONZE_MULTIPLIER))))
+
+(define-private (update-user-tier-internal (user principal) (new-lifetime-tickets uint))
+    (let ((new-tier (calculate-tier new-lifetime-tickets)))
+        (map-set user-tier-info
+            {user: user}
+            {lifetime-tickets: new-lifetime-tickets, current-tier: new-tier})
+        new-tier))
 
 (define-public (start-lottery)
     (begin
@@ -110,18 +154,22 @@
 (define-public (buy-ticket)
     (let ((current-lottery-id (var-get lottery-id))
           (current-ticket-number (+ (var-get ticket-counter) u1))
-          (referral-data (map-get? user-referrals {user: tx-sender})))
+          (referral-data (map-get? user-referrals {user: tx-sender}))
+          (current-info (default-to {lifetime-tickets: u0, current-tier: TIER_BRONZE}
+                                   (map-get? user-tier-info {user: tx-sender})))
+          (new-lifetime-tickets (+ (get lifetime-tickets current-info) u1)))
         (begin
             (asserts! (var-get is-lottery-active) ERR_LOTTERY_NOT_ACTIVE)
             (try! (stx-transfer? TICKET_PRICE tx-sender (as-contract tx-sender)))
             (var-set ticket-counter current-ticket-number)
             (var-set current-prize-pool (+ (var-get current-prize-pool) TICKET_PRICE))
             (var-set total-tickets-sold (+ (var-get total-tickets-sold) u1))
+            (update-user-tier-internal tx-sender new-lifetime-tickets)
             (match referral-data
                 referrer-info (let ((referral-reward (calculate-referral-reward TICKET_PRICE)))
                                 (process-referral-reward tx-sender (get referrer referrer-info) referral-reward))
                 true)
-            (map-set lottery-tickets 
+            (map-set lottery-tickets
                 {lottery-id: current-lottery-id, ticket-number: current-ticket-number}
                 {owner: tx-sender, block-height: stacks-block-height})
             (add-ticket-to-user current-lottery-id tx-sender current-ticket-number)
@@ -307,3 +355,41 @@
 
 (define-read-only (has-referrer (user principal))
     (is-some (map-get? user-referrals {user: user})))
+
+(define-read-only (get-user-tier-info (user principal))
+    (default-to
+        {lifetime-tickets: u0, current-tier: TIER_BRONZE}
+        (map-get? user-tier-info {user: user})))
+
+(define-read-only (get-next-tier-requirements (user principal))
+    (let ((tier-info (default-to
+            {lifetime-tickets: u0, current-tier: TIER_BRONZE}
+            (map-get? user-tier-info {user: user})))
+          (current-tier (get current-tier tier-info))
+          (lifetime-tickets (get lifetime-tickets tier-info)))
+        {current-tier: current-tier,
+         current-tickets: lifetime-tickets,
+         next-tier: (if (< current-tier TIER_PLATINUM) (+ current-tier u1) TIER_PLATINUM),
+         tickets-needed: (if (is-eq current-tier TIER_BRONZE)
+            (- SILVER_THRESHOLD lifetime-tickets)
+            (if (is-eq current-tier TIER_SILVER)
+                (- GOLD_THRESHOLD lifetime-tickets)
+                (if (is-eq current-tier TIER_GOLD)
+                    (- PLATINUM_THRESHOLD lifetime-tickets)
+                    u0))
+        )}))
+
+(define-read-only (get-tier-multiplier-info)
+    {bronze: {threshold: BRONZE_THRESHOLD, multiplier: BRONZE_MULTIPLIER},
+     silver: {threshold: SILVER_THRESHOLD, multiplier: SILVER_MULTIPLIER},
+     gold: {threshold: GOLD_THRESHOLD, multiplier: GOLD_MULTIPLIER},
+     platinum: {threshold: PLATINUM_THRESHOLD, multiplier: PLATINUM_MULTIPLIER}})
+
+(define-read-only (get-user-odds-multiplier (user principal))
+    (let ((tier-info (default-to
+            {lifetime-tickets: u0, current-tier: TIER_BRONZE}
+            (map-get? user-tier-info {user: user})))
+          (multiplier (get-multiplier-for-tier (get current-tier tier-info))))
+        {tier: (get current-tier tier-info),
+         multiplier-percentage: multiplier,
+         multiplier-value: (/ multiplier u100)}))
